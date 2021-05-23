@@ -1,0 +1,1282 @@
+"fitfclust" <-
+  function(x=NULL,curve=NULL,timeindex=NULL,data=NULL, q = 5, h = 1, p = 5,
+           K = 2, tol = 0.001, maxit = 20, pert =  
+             0.01, grid = seq(0, 1, length = 100), hard = F, plot= F,trace=F)
+  {
+    # This is the main function to implement the FClust procedure.
+    library(splines)
+    if (is.null(data))
+      data <- list(x=x,curve=curve,timeindex=timeindex)
+    initfit <- fclustinit(data = data, pert = pert, grid = grid, h = h,
+                          p = p, q = q, K = K)
+    # Initialize the parameters
+    parameters <- initfit$parameters
+    vars <- initfit$vars
+    S <- initfit$S
+    FullS <- initfit$FullS
+    sigma.old <- 0
+    sigma.new <- 1
+    ind <- 1
+    # Main loop. Iterates between M and E steps and stops when
+    # sigma  has converged.
+    while(abs(sigma.old - sigma.new)/sigma.new > tol & (ind <= maxit)) {
+      parameters <- fclustMstep(parameters, data, vars, S, tol, p, hard)
+      vars <- fclustEstep(parameters, data, vars, S, hard)
+      sigma.old <- sigma.new
+      sigma.new <- parameters$sigma[1]
+      if (trace)
+        print(paste("Iteration", ind,": Sigma = ",sigma.new))
+      # Plot cluster mean curves.  
+      if(plot){
+        cluster.mean <- matrix(0,K,dim(FullS)[1])
+        for(k in 1:K)
+          cluster.mean[k,] <- FullS %*% (parameters$lambda.zero + parameters$Lambda %*% parameters$alpha[k,  ])
+        plot(grid,grid,ylim=range(cluster.mean),type='n',ylab="Cluster Mean")
+        for(k in 1:K)
+          lines(grid,cluster.mean[k,], col = 4, lwd = 2)
+      }
+      ind <- ind + 1
+    }
+    # Enforce parameter constraint (7)
+    cfit <- fclustconst(data, parameters, vars, FullS)
+    list(data=data,parameters = cfit$parameters, vars = cfit$vars, FullS = FullS,grid=grid)
+  }
+
+"fclustinit" <-
+  function(data, pert = 0, grid = seq(0.01, 1, length = 100), h = 1, p = 2, q = 5,K = K){
+    S <- FullS <- NULL
+    # This function initializes all the parameters.
+    # Produce spline basis matrix
+    FullS <- cbind(1, ns(grid, df = (q - 1))) #basis为什么这样建
+    FullS <- svd(FullS)$u#奇异分解UDt(V)
+    S <- FullS[data$timeindex,  ]#提取有时间的行
+    N <- length(table(data$curve))
+    # Compute initial estimate of basis coefficients.
+    points <- matrix(0,N,sum(q))#? why sum
+    for (i in 1:N){
+      Si <- S[data$curve==i,]
+      xi <- data$x[data$curve==i]
+      points[i,] <- solve(t(Si) %*% Si + pert * diag(q)) %*% t(Si) %*%xi}#？这个式子是什么意思，文中没有
+    # Use k-means to get initial cluster memberships from points.#kmeans 做一个粗略的initial
+    if(K > 1)
+      class <- kmeans(points, K, 10)$cluster
+    else class <- rep(1, N)
+    # Initial estimates for the posterior probs of cluster membership.
+    piigivej <- matrix(0, N, K)#vector
+    piigivej[col(piigivej) == class] <- 1#得到vector（0，0，1）诸如此类
+    # Calculate coefficeints for cluster means.
+    classmean <- matrix(0,K,q)
+    for (k in 1:K)
+      classmean[k,] <- apply(points[class==k,],2,mean)
+    # Initialize lambda.zero, Lambda and alpha as defined in paper.
+    lambda.zero <- apply(classmean, 2, mean)
+    Lambda <- as.matrix(svd(scale(classmean, scale = F))$v[, 1:h])#？why h=1
+    alpha <- scale(classmean, scale = F)%*%Lambda
+    # Calculate estimates for gamma and gprod.
+    gamma <- t(t(points) - lambda.zero - (Lambda %*% t(alpha[class,  ])))
+    gprod <- NULL
+    for(i in 1:N)
+      gprod <- cbind(gprod, (gamma[i,  ]) %*% t(gamma[i,  ])) #? what is gprod
+    gamma <- array(gamma[, rep(1:sum(q), rep(K, sum(q)))], c(N, K, sum(q)))
+    gcov <- matrix(0, sum(q), N * sum(q))
+    list(S = S, FullS = FullS, parameters = list(lambda.zero = lambda.zero,
+                                                 Lambda = Lambda, alpha = alpha), vars = list(gamma = gamma,
+                                                                                              gprod = gprod, gcov = gcov, piigivej = piigivej))
+  }
+
+"fclustMstep" <-
+  function(parameters, data, vars, S, tol, p, hard)
+  {
+    # This function implements the M step of the EM algorithm.
+    K <- dim(parameters$alpha)[1]
+    alpha <- parameters$alpha
+    Lambda <- parameters$Lambda
+    gamma <- vars$gamma
+    gcov <- vars$gcov
+    curve <- data$curve
+    piigivej <- vars$piigivej
+    N <- dim(gamma)[1]
+    K <- dim(alpha)[1]
+    h <- dim(alpha)[2]
+    n <- length(curve)
+    q <- dim(S)[2]
+    sigma.old <- 2
+    sigma <- 1
+    # Compute pi.
+    if(hard)
+      parameters$pi <- rep(1/K, K)
+    else parameters$pi <- apply(vars$piigivej, 2, mean) #mean of 0-1 vector
+    # Compute rank p estimate of Gamma
+    ind <- matrix(rep(c(rep(c(1, rep(0, q - 1)), N), 0), q)[1:(N*q^2)], N * q, q)
+    gsvd <- svd(vars$gprod %*% ind/N)
+    gsvd$d[ - (1:p)] <- 0
+    parameters$Gamma <- gsvd$u %*% diag(gsvd$d) %*% t(gsvd$u)
+    # This loop iteratively calculates alpha and then Lambda and stops
+    # when they have converged.
+    loopnumber <- 1
+    while((abs(sigma.old[1] - sigma[1])/sigma[1] > tol) & (loopnumber <10)){
+      sigma.old <- sigma
+      # Calculate lambda.zero.
+      gamma.pi <- diag(S %*% t(apply(gamma * as.vector(piigivej),
+                                     c(1, 3), sum)[curve,  ]))
+      alpha.pi <- t(matrix(apply(alpha, 2, function(x, piigivej,K)
+      {rep(1, K) %*% (piigivej * x)}
+      , t(piigivej), K), N, h)[curve,  ])
+      lambda.zero <- solve(t(S) %*% S) %*% t(S) %*% (data$x - diag(
+        S %*% Lambda %*% alpha.pi) - gamma.pi)
+      x <- data$x - S %*% lambda.zero
+      # Calculate alpha.
+      for(i in 1.:K) {
+        S.Lam <- S %*% Lambda
+        S.Lam.pi <- S.Lam * piigivej[curve, i]
+        if(sum(piigivej[, i]) > 10^(-4))
+          alpha[i,  ] <- solve(t(S.Lam.pi) %*% S.Lam) %*%
+          t(S.Lam.pi) %*% (x - diag(S %*% t(gamma[curve, i,  ])))
+        else print("Warning: empty cluster")
+      }
+      # Calculate Lambda given alpha. This is done by iterating
+      # through each column of Lambda holding the other columns fixed.
+      for(m in 1:h) {
+        pi.alphasq <- apply(t(piigivej) * (alpha^2)[, m], 2,sum)[curve]
+        pi.alpha <- apply(t(piigivej) * alpha[, m], 2, sum)[curve]
+        S.Lambda <- t(S %*% Lambda)
+        if(h != 1) {
+          temp <- NULL
+          for(i in 1:K) {
+            temp <- cbind(temp, as.vector(rep(1, h - 1) %*% matrix((S.Lambda *
+                                                                      alpha[i,  ])[ - m,  ], h - 1,dim(S)[1])) * alpha[i, m])
+          }
+          otherLambda <- (temp * piigivej[curve,  ])%*%rep(1, K)
+        }
+        else otherLambda <- 0
+        gamma.pi.alpha <- apply(gamma * as.vector(piigivej) *
+                                  rep(alpha[, m], rep(N, K)), c(1, 3), sum)[curve,  ]
+        Lambda[, m] <- solve(t(S * pi.alphasq) %*% S) %*% t(S) %*%
+          (x * pi.alpha - otherLambda - (S *gamma.pi.alpha) %*% rep(1, sum(q)))
+      }
+      # Calculate sigma 
+      ind <- matrix(rep(c(rep(F, q), rep(T, N * q)),N)
+                    [1:(N * N * q)], N, N * q, byrow = T)[rep(1:N, table(curve)),]
+      mat1 <- matrix(rep(S, N), n, N * q)
+      mat3 <- t(mat1)
+      mat3[t(ind)] <- 0
+      ind2 <- matrix(rep(c(rep(F, q), rep(T, N * q)),
+                         N)[1:(N * N * q)], N, N * q, byrow = T)[rep(1:N, rep(q, N)),]
+      mat2 <- matrix(rep(t(gcov), N), N * q, N * q,byrow = T)
+      mat2[ind2] <- 0
+      econtrib <- 0
+      for(i2 in 1:K) {
+        vect1 <- x - S %*% Lambda %*% alpha[
+          i2,  ] - (S * gamma[curve, i2,  ]) %*% rep(1, q)
+        econtrib <- econtrib + t(piigivej[curve,i2] * vect1) %*% vect1
+      }
+      sigma <- as.vector((econtrib + sum(diag(mat1 %*% mat2 %*% mat3)))/n)
+      loopnumber <- loopnumber + 1
+    }
+    parameters$lambda.zero <- as.vector(lambda.zero)
+    parameters$alpha <- alpha
+    parameters$Lambda <- Lambda
+    parameters$sigma <- sigma
+    parameters
+  }
+
+"fclustEstep" <-
+  function(parameters, data, vars, S, hard)
+  {
+    # This function performs the E step of the EM algorithm by
+    # calculating the expected values of gamma and gamma %*% t(gamma)
+    # given the current parameter estimates.
+    par <- parameters
+    N <- dim(vars$gamma)[1]
+    K <- dim(vars$gamma)[2]
+    q <- dim(vars$gamma)[3]
+    Gamma <- par$Gamma
+    Lambda.alpha <- par$lambda.zero + par$Lambda %*% t(par$alpha)
+    vars$gprod <- vars$gcov <- NULL
+    for(j in 1:N) {
+      # Calculate expected value of gamma.
+      Sj <- S[data$curve == j,  ]
+      nj <- sum(data$curve == j)
+      invvar <- diag(1/rep(par$sigma, nj))
+      Cgamma <- Gamma - Gamma %*% t(Sj) %*% solve(diag(nj) + Sj %*%
+                                                    Gamma %*% t(Sj) %*% invvar) %*% invvar %*% Sj %*% Gamma
+      centx <- data$x[data$curve == j] - Sj %*% Lambda.alpha
+      vars$gamma[j,  ,  ] <- t(Cgamma %*% t(Sj) %*% invvar %*% centx)
+      # Calculate pi i given j.
+      covx <- Sj %*% par$Gamma %*% t(Sj) + solve(invvar)
+      d <- exp( - diag(t(centx) %*% solve(covx) %*% centx)/2) * par$pi
+      vars$piigivej[j,  ] <- d/sum(d)
+      if(hard) {
+        m <- order( - d)[1]
+        vars$piigivej[j,  ] <- 0
+        vars$piigivej[j, m] <- 1
+      }
+      # Calculate expected value of gamma %*% t(gamma).
+      vars$gprod <- cbind(vars$gprod, t(matrix(vars$gamma[j,  ,  ],
+                                               K, q)) %*% (matrix(vars$gamma[j,  ,  ], K, q) * vars$
+                                                             piigivej[j,  ]) + Cgamma)
+      vars$gcov <- cbind(vars$gcov, Cgamma)
+    }
+    vars
+  }
+
+
+"fclustconst" <-
+  function(data, parameters, vars, S)
+  {
+    # This function enforces the constraint (7) from the paper on the
+    # parameters. This means that the alphas can be interpreted as the
+    # number of standard deviations that the groups are apart etc.
+    par <- parameters
+    A <- t(S) %*% solve(par$sigma * diag(dim(S)[1]) + S %*% par$Gamma %*%
+                          t(S)) %*% S
+    svdA <- svd(A)
+    sqrtA <- diag(sqrt(svdA$d)) %*% t(svdA$u)
+    negsqrtA <- svdA$u %*% diag(1/sqrt(svdA$d))
+    finalsvd <- svd(sqrtA %*% par$Lambda)
+    par$Lambda <- negsqrtA %*% finalsvd$u
+    if(dim(par$Lambda)[2] > 1)
+      par$alpha <- t(diag(finalsvd$d) %*% t(finalsvd$v) %*% t(par$alpha))
+    else par$alpha <- t(finalsvd$d * t(finalsvd$v) %*% t(par$alpha))
+    meanalpha <- apply(par$alpha, 2, mean)
+    par$alpha <- t(t(par$alpha) - meanalpha)
+    par$lambda.zero <- par$lambda.zero + par$Lambda %*% meanalpha
+    list(parameters = par, vars = vars)
+  }
+
+"nummax" <-
+  function(X)
+  {
+    ind <- rep(1, dim(X)[1])
+    m <- X[, 1]
+    if(dim(X)[2] > 1)
+      for(i in 2:dim(X)[2]) {
+        test <- X[, i] > m
+        ind[test] <- i
+        m[test] <- X[test, i]
+      }
+    list(ind = ind, max = m)
+  }
+
+"fclust.pred" <-
+  function(fit,data=NULL,reweight=F)
+  {
+    # This function produces the alpha hats used to provide a low
+    # dimensional pictorial respresentation of each curve. It also
+    # produces a class prediction for each curve. It takes as
+    # input the fit from fldafit (for predictions on the original data)
+    # or the fit and a new data set (for predictions on new data).
+    if (is.null(data))
+      data <- fit$data
+    FullS <- fit$FullS
+    par <- fit$parameters
+    curve <- data$curve
+    time <- data$time
+    N <- length(table(curve))
+    h <- dim(par$alpha)[2]
+    alpha.hat <- matrix(0, N, h)
+    K <- dim(fit$par$alpha)[1]
+    distance <- matrix(0, N, K)
+    Calpha <- array(0, c(N, h, h))
+    for(i in 1:N) {
+      Sij <- FullS[time[curve == i],  ]
+      xij <- data$x[curve == i]
+      n <- length(xij)
+      Sigma <- par$sigma * diag(n) + Sij %*% par$Gamma %*% t(Sij)
+      # Calculate covariance for each alpha hat.
+      InvCalpha <- t(par$Lambda) %*% t(Sij) %*% solve(Sigma) %*% Sij %*%
+        par$Lambda
+      Calpha[i,  ,  ] <- solve(InvCalpha)
+      # Calculate each alpha hat.
+      alpha.hat[i,  ] <- Calpha[i,  ,  ] %*% t(par$Lambda) %*% t(
+        Sij) %*% solve(Sigma) %*% (xij - Sij %*% par$lambda.zero)
+      # Calculate the matrix of distances, relative to the
+      # appropriate metric of each curve from each class centroid. 
+      for (k in 1:K){
+        y <- as.vector(alpha.hat[i,])-fit$par$alpha[k,]
+        distance[i,k] <- t(y)%*%InvCalpha %*%y}}
+    # Calculate final class predictions for each curve.
+    class.pred <- rep(1, N)
+    log.pi <- log(fit$par$pi)
+    if (!reweight)
+      log.pi <- rep(0,K)
+    probs <- t(exp(log.pi-t(distance)/2))
+    probs <- probs/apply(probs,1,sum)
+    m <- probs[,1]
+    if(K != 1)
+      for(k in 2:K) {
+        test <- (probs[, k] > m)
+        class.pred[test] <- k
+        m[test] <- probs[test, k]
+      }
+    list(Calpha = Calpha, alpha.hat = alpha.hat, class.pred = class.pred,
+         distance = distance, m = m,probs=probs)
+  }
+
+"fclust.curvepred" <-
+  function(fit, data=NULL, index=NULL, tau = 0.95, tau1 = 0.975)
+  {
+    if (is.null(data))
+      data <- fit$data
+    if (is.null(index))
+      index <- 1:length(table(data$curve))
+    tau2 <- tau/tau1
+    sigma <- fit$par$sigma
+    Gamma <- fit$par$Gamma
+    Lambda <- fit$par$Lambda
+    alpha <- fit$par$alpha
+    lambda.zero <- as.vector(fit$par$lambda.zero)
+    S <- fit$FullS
+    N <- length(index)
+    upci <-lowci <- uppi <- lowpi <- gpred <- matrix(0,N,nrow(S))
+    etapred <- matrix(0,N,ncol(S))
+    ind <- 1
+    Lambda.alpha <- lambda.zero + Lambda %*% t(alpha)
+    for (i in index){
+      y <- data$x[data$curve == i]
+      Si <- S[data$time[data$curve == i],  ]
+      ni <- dim(Si)[1]
+      invvar <- diag(1/rep(sigma, ni))
+      covx <- Si %*% Gamma %*% t(Si) + solve(invvar)
+      centx <- data$x[data$curve == i] - Si %*% Lambda.alpha
+      d <- exp( - diag(t(centx) %*% solve(covx) %*% centx)/2) * fit$par$pi
+      pi <- d/sum(d)
+      K <- length(pi)
+      mu <- lambda.zero + Lambda %*% t(alpha * pi) %*% rep(1, K)
+      cov <- (Gamma - Gamma %*% t(Si) %*% solve(diag(ni) + Si %*% Gamma %*%
+                                                  t(Si)/sigma) %*% Si %*% Gamma/sigma)/sigma
+      etapred[ind,] <- mu + cov %*% t(Si) %*% (y - Si %*% mu)
+      ord <- order( - pi)
+      numb <- sum(cumsum(pi[ord]) <= tau1) + 1
+      v <- diag(S %*% (cov * sigma) %*% t(S))
+      pse <- sqrt(v + sigma)
+      se <- sqrt(v)
+      lower.p <- upper.p <- lower.c <- upper.c <- matrix(0, nrow(S), numb)
+      for(j in 1:numb) {
+        mu <- lambda.zero + Lambda %*% alpha[ord[j],  ]
+        mean <- S %*% (mu + cov %*% t(Si) %*% (y - Si %*% mu))
+        upper.p[, j] <- mean + qnorm(tau2) * pse
+        lower.p[, j] <- mean - qnorm(tau2) * pse
+        upper.c[, j] <- mean + qnorm(tau2) * se
+        lower.c[, j] <- mean - qnorm(tau2) * se
+      }
+      upci[ind,] <- nummax(upper.c)$max
+      lowci[ind,] <-  - nummax( - lower.c)$max
+      uppi[ind,] <- nummax(upper.p)$max
+      lowpi[ind,] <-  - nummax( - lower.p)$max
+      gpred[ind,] <- as.vector(S %*%etapred[ind,])
+      ind <- ind+1
+    }
+    meancurves <- S%*%Lambda.alpha
+    list(etapred = etapred, gpred = gpred,  upci = upci,lowci = lowci,  uppi = uppi, lowpi = lowpi,index=index,grid=fit$grid,data=data,meancurves=meancurves)
+  }
+
+"fclust.discrim" <-
+  function(fit,absvalue=F){
+    S <- fit$FullS
+    sigma <- fit$par$sigma
+    n <- nrow(S)
+    Gamma <- fit$par$Gamma
+    Sigma <- S%*%Gamma%*%t(S)+sigma*diag(n)
+    Lambda <- fit$par$Lambda
+    discrim <- solve(Sigma)%*%S%*%Lambda
+    if (absvalue)
+      discrim <- abs(discrim)
+    n <- ncol(discrim)
+    nrows <- ceiling(sqrt(n))
+    par(mfrow=c(nrows,nrows))
+    for (i in 1:n){
+      plot(fit$grid,discrim[,i],ylab=paste("Discriminant Function ",i),xlab="Time",type='n')
+      lines(fit$grid,discrim[,i],lwd=3)
+      abline(0,0)}}
+
+"fclust.plotcurves" <-
+  function(object=NULL,fit=NULL,index=NULL,ci=T,pi=T,clustermean=F){
+    if (is.null(object))
+      object <- fclust.curvepred(fit)
+    if (is.null(index))
+      index <- 1:length(table(object$data$curve))
+    r <- ceiling(sqrt(length(index)))
+    par(mfrow=c(r,r))
+    for (i in index){
+      grid <- object$grid
+      upci <- object$upci[i,]
+      uppi <- object$uppi[i,]
+      lowci <- object$lowci[i,]
+      lowpi <- object$lowpi[i,]
+      gpred <- object$gpred[i,]
+      meancurves <- (object$mean)
+      if (clustermean)
+        yrange <- c(min(c(lowpi,meancurves)),max(c(uppi,meancurves)))
+      else
+        yrange <- c(min(lowpi),max(uppi))
+      plot(grid,grid,ylim=yrange,ylab="Predictions",xlab="Time",type='n',
+           main=paste("Curve ",i))
+      if (clustermean)
+        for (k  in 1:ncol(meancurves))
+          lines(grid,meancurves[,k],col=6,lty=2,lwd=2)
+      if (ci){
+        lines(grid,upci,col=3)
+        lines(grid,lowci,col=3)}
+      if (pi){
+        lines(grid,uppi,col=4)
+        lines(grid,lowpi,col=4)}
+      lines(grid,gpred,col=2,lwd=2)
+      lines(grid[object$data$time[object$data$curve==i]],object$data$x[object$data$curve==i],lwd=2)
+      points(grid[object$data$time[object$data$curve==i]],object$data$x[object$data$curve==i],pch=19,cex=1.5)
+    }
+  }
+
+
+
+library(gdata)
+library(fda)
+library(flexclust)
+library("funHDDC")
+library(fda)
+library(splines)
+library(flexclust)
+library("writexl")
+library(ggplot2)
+library(ftsa)
+library(rwalkr)
+library(imputeTS)
+library(plot.matrix)
+library(fdapace)
+library(funHDDC)
+#growth data
+#“Clustering for Sparsely Sampled Functional Data (GARETH M. JAMES & CATHERINE A. SUGAR (2003))
+data = read.table("/Users/chengyaxiong/Desktop/Chiou\ 2007\ R\ codes/growth.dat",dec = ".")
+names(data) <- c("curves", "true-label", "time","x")
+grid = c(1,1.25,1.5,1.75,2,3,4,5,6,7,8,8.5,9,9.5,10,10.5,11,11.5,12,12.5,13,13.5,14,14.5,15,15.5,16,16.5,17,17.5,18)
+len = vector()
+data = as.matrix(data)
+for (i in 1:93) {
+  len[i] = length(which(data[,"curves"] == i))
+}
+which(data[,"x"]<=0) #check unreliable measurement
+which(data[,"x"]=="NULL") #check missing value
+length(which(data[,"x"]>0)) #ensuring one observation exists on each time point
+timeindex = rep( 1:31, times = 93)
+data = cbind(data,timeindex)
+testfit <- fitfclust(x=data[,"x"],curve = data[,"curves"],timeindex = data[,"timeindex"],q = 4,h = 1, p = 5,K = 2, tol = 0.001, maxit = 20, pert = 0.01, grid = c(1,1.25,1.5,1.75,2,3,4,5,6,7,8,8.5,9,9.5,10,10.5,11,11.5,12,12.5,13,13.5,14,14.5,15,15.5,16,16.5,17,17.5,18), hard = F, plot= F,trace=T)
+fclust.pred(testfit)$class
+fclust.plotcurves(fit=testfit,index=93,clustermean=T) #curve 93
+fclust.discrim(testfit,abs=T)
+j = 1
+cls = vector()
+for (i in 1:93) {
+  cls[i] = data[,"true-label"][j]
+  j = j + 31
+}
+table(cls,fclust.pred(testfit)$class)
+randIndex(table(cls,fclust.pred(testfit)$class))#ARI = 0.13176 
+# accurcy = length(which(cls == fclust.pred(testfit)$class))/93 #accuracy = 0.688172 
+
+#growth data
+#Functional Clustering and Identif􏰌ing Substructures of Longitudinal Data(chiou 2007)
+kmeansgrowth2007 = as.matrix(read.xls("/Users/chengyaxiong/Desktop/thesis\ important\ matrerial/Growth-k-means-results.xlsx",header=F))
+idkcfc = c(2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,2,1,1,1,2,1,1,1,1,1,1,1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,1,2,1,1,1)
+idkcfc[which(idkcfc == 2)] =3
+idkcfc[which(idkcfc == 1)] =2
+idkcfc[which(idkcfc == 3)] =1
+ARI2007 = randIndex(cls,idkcfc) #ARI = 0.7559977
+
+#growth data
+#Model-based clustering of time series in group-specific functional subspaces(Charles Bouveyron & Julien Jacques (2011))
+data = read.table("/Users/chengyaxiong/Desktop/Chiou\ 2007\ R\ codes/growth.dat",dec = ".")
+names(data) <- c("curves", "true-label", "time","x")
+label = data[,"true-label"]
+data = as.matrix(data)
+dat = matrix(0,31,93)
+for (i in 1:93) {
+  r = which(data[,"curves"] == i)
+  dat[,i] = data[,"x"][r]
+}
+dat = as.data.frame(dat)
+colname = sprintf("curve%d", 1:93)
+names(dat) = colname
+dat = as.matrix(dat)
+
+#init="kmeans"
+#modelchose = vector()
+#j=1
+#for (i in seq(5,15,by = 2)) {
+       #basis <- create.fourier.basis(c(0, 1), nbasis= i)
+       #var1<-smooth.basis(argvals=seq(0,1,length.out = 31),y=dat,fdParobj=basis)$fd
+       #res.uni<-funHDDC(var1,K=2,model=c("AkjBkQkDk", 'AkjBQkDk', 'AkBkQkDk', 'ABkQkDk', 'AkBQkDk', 'ABQkDk','AkjBkQkDk'),init="kmeans",threshold=0.2)
+       #modelchose[j] = paste(res.uni$allCriteria$model[which(res.uni$allCriteria$BIC == min(res.uni$allCriteria$BIC),arr.ind = T)],i)
+       #j = j+1
+#}
+
+#init="random"       选出来的最佳模型和kmeans的不一样
+# modelchoseram = vector()
+# j=1
+# for (i in seq(5,25,by = 2)) {
+#   basis <- create.fourier.basis(c(0, 1), nbasis= i)
+#   var1<-smooth.basis(argvals=seq(0,1,length.out = 31),y=dat,fdParobj=basis)$fd
+#   res.uni<-funHDDC(var1,K=2,model=c("AkjBkQkDk", 'AkjBQkDk', 'AkBkQkDk', 'ABkQkDk', 'AkBQkDk', 'ABQkDk','AkjBkQkDk'),init="random",threshold=0.2)
+#   modelchoseram[j] = paste(res.uni$allCriteria$model[which(res.uni$allCriteria$BIC == min(res.uni$allCriteria$BIC),arr.ind = T)],i)
+#   j = j+1
+# }
+# 
+# modelsram = gsub("\\d","",modelchoseram)#initial = random, 在不同的nbasis下分别的模型
+# modelsram = chartr("KJ","kj",modelsram)
+# modelsram = gsub(" ", "",modelsram)
+# classmatrix = matrix(0,nrow = length(seq(5,25,by = 2)),ncol = 93)
+# bas = seq(5,25,by = 2)
+# for (i in 1:length(seq(5,25,by = 2))) {
+#   basisR <- create.fourier.basis(c(0, 1),nbasis= bas[i])
+#   varR<-smooth.basis(argvals=seq(0,1,length.out = 31),y=dat,fdParobj=basisR)$fd
+#   res.uniR<-funHDDC(varR,K=2,model=modelsram[i],init="random",threshold=0.2)
+#   classmatrix[i,] = res.uniR$class
+# }
+# j = 1
+# cls = vector()
+# for (i in 1:93) {
+#   cls[i] = data[,"true-label"][j]
+#   j = j + 31
+# }
+# Accuracy2011 = vector()
+# for (i in 1:length(seq(5,25,by = 2))) {
+#   Accuracy2011[i] = length(which(cls == classmatrix[i,]))/93#accuracy = 0.9247312 
+# }
+# index = which(max(Accuracy2011) == Accuracy2011)
+# table(cls,classmatrix[index,],dnn=c("True clusters","FunHDDC clusters")) 
+# plot(var1,col=classmatrix[index,])
+# finalmodel = modelsram[index]
+# finalbasis = bas[index]
+# finalAccu = Accuracy2011[index]
+
+
+#natual cubic splines basis
+modelchoseramcb = vector()
+j=1
+for (i in 1:23) {
+  basiscb = create.bspline.basis(c(0, 18),nbasis= i+3)
+  varcb<-smooth.basis(argvals=seq(0,18,length.out = 31),y=dat,fdParobj=basiscb)$fd
+  res.uni<-funHDDC(varcb,K=2,model=c("AkjBkQkDk", 'AkjBQkDk', 'AkBkQkDk', 'ABkQkDk', 'AkBQkDk', 'ABQkDk','AkjBkQkDk'),init="random",threshold=0.2)
+  modelchoseramcb[j] = paste(res.uni$allCriteria$model[which(res.uni$allCriteria$BIC == min(res.uni$allCriteria$BIC),arr.ind = T)],i)
+  j = j+1
+}
+
+modelchoseramcb = gsub("\\d","",modelchoseramcb)#initial = random
+modelchoseramcb = chartr("KJ","kj",modelchoseramcb)
+modelchoseramcb = gsub(" ", "",modelchoseramcb)
+classmatrixcb = matrix(0,nrow = 23,ncol = 93)
+growth2011BIC = vector()
+for (i in 1:23) {
+  basiscb = create.bspline.basis(c(0, 18),nbasis= i+3)
+  varcb<-smooth.basis(argvals=seq(0,18,length.out = 31),y=dat,fdParobj=basiscb)$fd
+  res.uni<-funHDDC(varcb,K=2,model=modelchoseramcb[i],init="random",threshold=0.2)
+  classmatrixcb[i,] = res.uni$class
+  growth2011BIC[i] = res.uni$BIC
+}
+j = 1
+cls = vector()
+for (i in 1:93) {
+  cls[i] = data[,"true-label"][j]
+  j = j + 31
+}
+bascb=c(4:26)
+indexcb = which(min(growth2011BIC) == growth2011BIC)
+bascb[indexcb]
+modelgrowth2011 = modelchoseramcb[indexcb]
+ARI2011growth = randIndex(cls,classmatrixcb[indexcb,])
+#plot for 2003
+basiscb = create.bspline.basis(c(0, 18),nbasis= 26)
+varcb<-smooth.basis(argvals=seq(0,18,length.out = 31),y=dat,fdParobj=basiscb)$fd
+par(mfrow = c(1, 2))
+plot(varcb,col=fclust.pred(testfit)$class,xlab = "(Predicted)Year", ylab= "Size") 
+plot(varcb,col=cls,xlab = "(True)Year", ylab= "Size") 
+#plot for 2007
+basiscb = create.bspline.basis(c(0, 18),nbasis= 26)
+varcb<-smooth.basis(argvals=seq(0,18,length.out = 31),y=dat,fdParobj=basiscb)$fd
+par(mfrow = c(1, 2))
+plot(varcb,col=idkcfc,xlab = "(Predicted)Year", ylab= "Size")
+plot(varcb,col=cls,xlab = "(True)Year", ylab= "Size") 
+#plot for 2011
+classmatrixcb[indexcb,][which(classmatrixcb[indexcb,]==1)]=3
+classmatrixcb[indexcb,][which(classmatrixcb[indexcb,]==2)]=1
+classmatrixcb[indexcb,][which(classmatrixcb[indexcb,]==3)]=2
+par(mfrow = c(1, 2))
+plot(varcb,col=classmatrixcb[indexcb,],xlab = "(Predicted)Year", ylab= "Size") 
+plot(varcb,col=cls,xlab = "(True)Year", ylab= "Size") ）
+finalmodelcb = modelchoseramcb[indexcb]
+finalbasiscb = bascb[indexcb]
+finalARI = ARI2011cb[indexcb] #ARI = 0.7943009
+
+
+randIndex(fclust.pred(testfit)$class,idkcfc)# ARI of 2003 and 2007 is 0.1018079 
+randIndex(fclust.pred(testfit)$class,res.uni$class)# ARI of 2003 and 2011 is 0.5780428 
+randIndex(idkcfc,res.uni$class)#ARI of 2007 and 2011 is 0.1165433
+
+
+
+#ECG data for 2003
+ECGtraindata = read.table("/Users/chengyaxiong/Downloads/ECG200/ECG200_TRAIN.txt", sep="")
+ECGtestdata = read.table("/Users/chengyaxiong/Downloads/ECG200/ECG200_TEST.txt", sep="")
+ECGdata = rbind(ECGtraindata,ECGtestdata)
+ecgdata = as.matrix(ECGdata[,-1])
+ECGcurves = sort(rep(c(1:200),times = 96))
+ECGtruel = rep(c(ECGdata[,1]),each = 96)
+tim = c(1:96)
+time = rep(tim,times = 200)
+ecgx = vector()
+j = 1
+for (i in 1:200) {
+  ecgx[j:(j+95)] = ecgdata[i,]
+  j = j+96
+}
+ecgdata = cbind(matrix(ECGcurves,byrow=T),matrix(ECGtruel,byrow = T),matrix(time,byrow = T),matrix(ecgx,byrow = T))
+data = data.frame(ecgdata)
+names(data) <- c("curves", "true-label", "time","x")
+grid = c(1:96)
+len = vector()
+data = as.matrix(data)
+for (i in 1:200) {
+  len[i] = length(which(data[,"curves"] == i))
+}
+which(data[,"x"]=="NULL") #check missing value
+timeindex = rep( 1:96, times = 200)
+data = cbind(data,timeindex)
+ECGtestfit <- fitfclust(x=data[,"x"],curve = data[,"curves"],timeindex = data[,"timeindex"],q = 5,h = 1, p = 5,K = 2, tol = 0.001, maxit = 20, pert = 0.01, grid = c(1:96), hard = F, plot= F,trace=T)
+fclust.pred(ECGtestfit)$class
+# ECGdata$V1[which(ECGdata$V1 == "-1")] = 3
+# ECGdata$V1[which(ECGdata$V1 == "1")] = 2
+# ECGdata$V1[which(ECGdata$V1 == "3")] = 1
+ARIECG = randIndex(table(ECGdata$V1,fclust.pred(ECGtestfit)$class)) # ARI is 0.08882391
+#import ECG xls
+data = as.data.frame(data)
+write_xlsx(data,"/Users/chengyaxiong/Desktop/69-4.Chiou/ECG.dat.xlsx")
+
+#ECG data for 2007
+idkcfcECG = as.matrix(read.xls("/Users/chengyaxiong/Desktop/thesis\ important\ matrerial/ECGlabel.xlsx",header=F))
+idkcfcECG = idkcfcECG[,1]
+randIndex(table(idkcfcECG,ECGdata$V1))# ARI is 0.1413434 
+randIndex(table(fclust.pred(ECGtestfit)$class,idkcfcECG))
+randIndex(table(res.uniECG$class,idkcfcECG))#ARI is 0.2697409 
+randIndex(table(fclust.pred(ECGtestfit)$class,res.uniECG$class))
+
+#ECG data for 2011
+library(flexclust)
+ECGtraindata = read.table("/Users/chengyaxiong/Downloads/ECG200/ECG200_TRAIN.txt", sep="")
+ECGtestdata = read.table("/Users/chengyaxiong/Downloads/ECG200/ECG200_TEST.txt", sep="")
+ECGdata = rbind(ECGtraindata,ECGtestdata)
+ecgdatac2011 = as.data.frame(t(ECGdata[,-1]))
+colname = sprintf("curve%d", 1:200)
+names(ecgdatac2011) = colname
+ecgdatac2011 = as.matrix(ecgdatac2011)
+modelECG = vector()
+ECGBIC = vector()
+j=1
+for (i in 1:10) {
+  basisECG = create.bspline.basis(c(0, 96),nbasis= i+10)
+  varECG<-smooth.basis(argvals=seq(0,96,length.out = 96),y=ecgdatac2011,fdParobj=basisECG)$fd
+  res.uni<-funHDDC(varECG,K=2,model=c("AkjBkQkDk", 'AkjBQkDk', 'AkBkQkDk', 'ABkQkDk', 'AkBQkDk', 'ABQkDk','AkjBkQkDk'),init="kmeans",threshold=0.2,itermax = 3000,eps=1e-4)
+  ECGBIC[j] = min(res.uni$allCriteria$BIC[which(res.uni$allCriteria$BIC!=-Inf)]) 
+  modelECG[j] = paste(res.uni$allCriteria$model[which(res.uni$allCriteria$BIC == min(res.uni$allCriteria$BIC[which(res.uni$allCriteria$BIC!=-Inf)]) ,arr.ind = T)],i)
+  j = j+1
+}
+modelECG = gsub("\\d","",modelECG)
+modelECG = chartr("KJ","kj",modelECG)
+modelECG = gsub(" ", "",modelECG)
+basisnumECG = c(11:20) 
+basisECG = create.bspline.basis(c(0, 96),nbasis= basisnumECG[which(ECGBIC==min(ECGBIC))])
+varECG<-smooth.basis(argvals=seq(0,96,length.out = 96),y=ecgdatac2011,fdParobj=basisECG)$fd
+res.uniECG<-funHDDC(varECG,K=2,model=modelECG[which(ECGBIC==min(ECGBIC))],init="random",threshold=0.2,itermax = 5000,eps = 1e-4)
+res.uniECG$class
+ECGdata$V1[which(ECGdata$V1 == "-1")] = 3
+ECGdata$V1[which(ECGdata$V1 == "1")] = 2
+ECGdata$V1[which(ECGdata$V1 == "3")] = 1
+ARIECG2011 = randIndex(table(res.uniECG$class,ECGdata$V1))
+ECGdata$V1[which(ECGdata$V1 == "1")] = 3
+ECGdata$V1[which(ECGdata$V1 == "2")] = 1
+ECGdata$V1[which(ECGdata$V1 == "3")] = 2
+#ECG for 2003
+par(mfrow = c(1, 2))
+plot(varECG,col=fclust.pred(ECGtestfit)$class,xlab = "(Predicted)time",ylab="Electrode")
+plot(varECG,col=ECGdata$V1,xlab = "(True)time",ylab="Electrode")
+#ECG for 2007
+par(mfrow = c(1, 2))
+plot(varECG,col=idkcfcECG,xlab = "(Predicted)time",ylab="Electrode")
+plot(varECG,col=ECGdata$V1,xlab = "(True)time",ylab="Electrode")
+res.uniECG$class[which(res.uniECG$class == "1")] = 3
+res.uniECG$class[which(res.uniECG$class == "2")] = 1
+res.uniECG$class[which(res.uniECG$class == "3")] = 2
+#ECG for 2011
+par(mfrow = c(1, 2))
+plot(varECG,col=res.uniECG$class,xlab = "(Predicted)time",ylab="Electrode")
+plot(varECG,col=ECGdata$V1,xlab = "(True)time",ylab="Electrode")
+
+
+#Kneading data for 2003
+kneadingdata = read.table("/Users/chengyaxiong/Desktop/kneading\ \ data.txt", sep=";",header = T)
+kneadingcurves = rep(1:90,each = 241)
+kneadingtruela = vector()
+for (i in 1:21690) {
+  if(i<=12050){
+    kneadingtruela[i] = 1 
+  }else{
+    kneadingtruela[i] = 2
+  }
+}
+kneadingtime = rep(seq(0,480,by = 2),90)
+kneadingx = vector()
+j = 1
+for (i in 1:90) {
+  kneadingx[j:(j+240)] = kneadingdata[,i+1]
+  j = j+241
+}
+kneadingdata = cbind(matrix(kneadingcurves,byrow=T),matrix(kneadingtruela,byrow = T),matrix(kneadingtime,byrow = T),matrix(kneadingx,byrow = T))
+kneadingdata = data.frame(kneadingdata)
+names(kneadingdata) <- c("curves", "true-label", "time","x")
+grid = seq(0,480,by=2)
+len = vector()
+kneadingdata = as.matrix(kneadingdata)
+for (i in 1:200) {
+  len[i] = length(which(kneadingdata[,"curves"] == i))
+}
+which(kneadingdata[,"x"]=="NULL") #check missing value
+timeindex = rep( 1:241, times = 90)
+kneadingdata = cbind(kneadingdata,timeindex)
+kneadingfit <- fitfclust(x=kneadingdata[,"x"],curve = kneadingdata[,"curves"],timeindex = kneadingdata[,"timeindex"],q = 5,h = 1, p = 5,K = 2, tol = 0.001, maxit = 20, pert = 0.01, grid = grid, hard = F, plot= F,trace=T)
+fclust.pred(kneadingfit)$class
+kneadingtrue = vector()
+j=1
+for (i in 1:90) {
+  kneadingtrue[i] = kneadingdata[,"true-label"][j]
+  j = j  + 241
+}
+ARIkneading = randIndex(kneadingtrue, fclust.pred(kneadingfit)$class) #ARI is 0.709866
+kneadingdata = as.data.frame(kneadingdata)
+library("writexl")
+write_xlsx(kneadingdata,"/Users/chengyaxiong/Desktop/thesis\ important\ matrerial/kneading\ data.xlsx")
+
+
+#kneading data for 2007
+kneading2007 = as.matrix(read.xls("/Users/chengyaxiong/Desktop/thesis\ important\ matrerial/kneadinglabel.xlsx",header=F))
+kneading2007 = kneading2007[,1]
+randIndex(table(kneading2007,kneadingtrue))#ARI in 2007 is 0.5325905 
+
+#kneading data for 2011
+kneadingdata = read.table("/Users/chengyaxiong/Desktop/kneading\ \ data.txt", sep=";",header = T)[,-1]
+colname = sprintf("curve%d", 1:90)
+names(kneadingdata) = colname
+kneadingdata = as.matrix(kneadingdata)
+modelkneading = vector()
+kneadingBIC = vector()
+classmatrixkneading = matrix(0,nrow = 30,ncol = 90)
+for (i in 1:30) {
+  basiskneading = create.bspline.basis(c(0, 241),nbasis= i+10)
+  varkneading<-smooth.basis(argvals=seq(0,241,length.out = 241),y=kneadingdata,fdParobj=basiskneading)$fd
+  res.uni<-funHDDC(varkneading,K=2,model=c("AkjBkQkDk", 'AkjBQkDk', 'AkBkQkDk', 'ABkQkDk', 'AkBQkDk', 'ABQkDk','AkjBkQkDk'),init="random",threshold=0.2,itermax = 2000)
+  kneadingBIC[i] = res.uni$allCriteria$BIC[which(res.uni$allCriteria$BIC == min(res.uni$allCriteria$BIC[which(res.uni$allCriteria$BIC!=-Inf)]))]
+  modelkneading[i] = paste(res.uni$allCriteria$model[which(res.uni$allCriteria$BIC == min(res.uni$allCriteria$BIC[which(res.uni$allCriteria$BIC!=-Inf)]),arr.ind=T)],i)
+}
+modelkneading = gsub("\\d","",modelkneading)#all ABKQKDK
+modelkneading = chartr("KJ","kj",modelkneading)
+modelkneading = gsub(" ", "",modelkneading)
+basiskneading = c(11:40)
+basiskneading = create.bspline.basis(c(0, 241),nbasis= basiskneading[which(kneadingBIC==min(kneadingBIC))])
+varkneading<-smooth.basis(argvals=seq(0,241,length.out = 241),y=kneadingdata,fdParobj=basiskneading)$fd
+res.uni<-funHDDC(varkneading,K=2,model=modelkneading[which(kneadingBIC==min(kneadingBIC))],init="random",threshold=0.2,itermax = 2000)
+finalclassknead11 = res.uni$class
+finalclassknead11[which(finalclassknead11 == 1)] = 3
+finalclassknead11[which(finalclassknead11 == 2)] = 1
+finalclassknead11[which(finalclassknead11 == 3)] = 2
+table(kneadingtrue,finalclassknead11,dnn=c("True clusters","FunHDDC clusters"))
+finalARI = randIndex(table(finalclassknead11,kneadingtrue)) #ARI is 0.7098602 
+#Kneading for 2003
+par(mfrow = c(1, 2))
+plot(varkneading,col=fclust.pred(kneadingfit)$class,xlab = "(Predicted)time",ylab="Resistance")
+plot(varkneading,col=kneadingtrue,xlab = "(True)time",ylab="Resistance")
+#Kneading for 2007
+par(mfrow = c(1, 2))
+plot(varkneading,col=kneading2007,xlab = "(Predicted)time",ylab="Resistance")
+plot(varkneading,col=kneadingtrue,xlab = "(True)time",ylab="Resistance")
+#Kneading for 2011
+par(mfrow = c(1, 2))
+plot(varkneading,col=finalclassknead11,xlab = "(Predicted)time",ylab="Resistance")
+plot(varkneading,col=kneadingtrue,xlab = "(True)time",ylab="Resistance")
+
+
+
+#traffic data 2003 (weekday)
+
+# pedestrian data
+# http://www.pedestrian.melbourne.vic.gov.au/
+# retrieved 2019 data
+setwd("/Users/chengyaxiong/Desktop/69-4.Chiou")
+ped <- read.csv('ped.csv')
+ped.count <- ped$Count # a long vector containing all counts from all stations
+# convert ped.count to 
+counts <- matrix(ped.count, nrow=63)#63 curves from Tuesday!
+counts = data.frame(counts)
+rownames(counts)<-paste(ped$Sensor[1:63],sep="")
+counts = as.matrix(counts)
+# ind.xx <- seq(33,nrow(ped),by=63)#
+# ggplot_na_distribution(counts[1,])
+plot(counts[33,301:540],type='l') 
+countsweekday = counts
+for (i in 1:52) {
+  countsweekday = countsweekday[,-c((97+(i-1)*5*24):(144+(i-1)*5*24))] #no weekend data
+}
+plot(countsweekday[33,301:700],type='l')
+# N <- ncol(counts)
+N = ncol(countsweekday)
+# N.NA <- rowSums(is.na(counts))#check NA value for each sensor
+N.NA <- rowSums(is.na(countsweekday))
+ind1 <- which(N.NA <= N/3)
+count03 <- countsweekday[ind1,]#52 curves left
+curves = rep(row.names(count03),each = 24)
+time = rep(0:23,times = 52)
+x2003 = matrix(0,nrow = 52,ncol = 24)
+na.matrix = matrix(0,nrow = 52,ncol = 24)
+for (k in 1:52) {
+  for (i in 1:24) {
+    for (j in c(seq(i,ncol(count03),by = 24))) {
+      if(is.na(count03[k,j])){
+        x2003[k,i] = x2003[k,i]
+        na.matrix[k,i] = na.matrix[k,i]+1
+      }else{
+        x2003[k,i] = x2003[k,i] + count03[k,j]
+        na.matrix[k,i] = na.matrix[k,i]
+      }
+    }
+  }
+}
+# for (i in 1:(365-2*52)) {
+#   a=a+is.na(count03[1,1+(i-1)*24])
+# } to check the na.matrix
+c = matrix(365,nrow = 52,ncol = 24)
+divide = c - na.matrix
+x2003 = x2003/divide
+xvalue = vector("numeric")
+for (i in 1:52) {
+  xvalue[(1+(i-1)*24):(24+(i-1)*24)] = x2003[i,]
+}
+trafficdata = cbind(matrix(curves,byrow=T),matrix(time,byrow = T),matrix(xvalue,byrow = T))
+timeindex = rep( 1:24, times = 52)
+data = cbind(trafficdata,timeindex)
+data = data.frame(data)
+grid = c(1:24)
+names(data) <- c("curves","time","x2003","timeindex")
+data = as.matrix(data)
+data[,"curves"] = rep(1:52,each = 24)
+trafficfit03 <- fitfclust(x=as.numeric(data[,"x2003"]),curve = as.numeric(data[,"curves"]),timeindex = as.numeric(data[,"timeindex"]),q = 5,h = 1, p = 5,K = 4, tol = 0.001, maxit = 20, pert = 0.01, grid = grid, hard = F, plot= F,trace=T)
+fclust.pred(trafficfit03)$class
+row.names(count03)[which(fclust.pred(trafficfit03)$class==1)]
+row.names(count03)[which(fclust.pred(trafficfit03)$class==2)]
+row.names(count03)[which(fclust.pred(trafficfit03)$class==3)]
+row.names(count03)[which(fclust.pred(trafficfit03)$class==4)]
+datalabel = cbind(data,forecast = rep(fclust.pred(trafficfit03)$class,each = 24))
+datalabel = as.data.frame(datalabel)
+datalabel[,"forecast"] = factor(datalabel[,"forecast"])
+plot(x2003[1,1:24],type = 'l',xlab = "Hour",ylab="Count",ylim=c(0,3000))
+for (i in 1:52) {
+  if(fclust.pred(trafficfit03)$class[i] ==1 ){
+    lines(x2003[i,1:24],col="DarkTurquoise",lty=1)
+  }else if (fclust.pred(trafficfit03)$class[i] ==2 ){
+    lines(x2003[i,1:24],col="DeepPink",lty=1)
+  }else if (fclust.pred(trafficfit03)$class[i] ==3 ){
+    lines(x2003[i,1:24],col="RosyBrown",lty=1)
+  }else if (fclust.pred(trafficfit03)$class[i] ==4 ){
+    lines(x2003[i,1:24],col="Pink",lty=1)
+  }
+}
+# data = as.data.frame(data)
+# library("writexl")
+# write_xlsx(data,"/Users/chengyaxiong/Desktop/thesis\ important\ matrerial/trafficdata.xlsx")
+
+
+#traffic data for 2007
+traffic2007 = as.matrix(read.xls("/Users/chengyaxiong/Desktop/thesis\ important\ matrerial/trafficlabel.xlsx",header=F))
+traffic2007 = traffic2007[,1]
+row.names(count03)[which(traffic2007==1)]
+row.names(count03)[which(traffic2007==2)]
+row.names(count03)[which(traffic2007==3)]
+row.names(count03)[which(traffic2007==4)]
+datalabel[,"forecast"] = factor(datalabel[,"forecast"])
+plot(x2003[1,1:24],type = 'l',xlab = "Hour",ylab="Count",ylim=c(0,3000))
+for (i in 1:52) {
+  if(traffic2007[i] ==1 ){
+    lines(x2003[i,1:24],col="DarkTurquoise",lty=1)
+  }else if (traffic2007[i] ==2 ){
+    lines(x2003[i,1:24],col="DeepPink",lty=1)
+  }else if (traffic2007[i] ==3 ){
+    lines(x2003[i,1:24],col="RosyBrown",lty=1)
+  }else if (traffic2007[i] ==4 ){
+    lines(x2003[i,1:24],col="Pink",lty=1)
+  }
+}
+
+
+ARI0307 = randIndex(table(fclust.pred(trafficfit03)$class,traffic2007))
+ARI0311 = randIndex(table(fclust.pred(trafficfit03)$class,res.uni11$class))
+ARI0711 = randIndex(table(traffic2007,res.uni11$class))
+#traffic data for 2011
+# pedestrian data
+# http://www.pedestrian.melbourne.vic.gov.au/
+# retrieved 2019 data
+setwd("/Users/chengyaxiong/Desktop/69-4.Chiou")
+ped <- read.csv('ped.csv')
+ped.count <- ped$Count # a long vector containing all counts from all stations
+# convert ped.count to 
+counts <- matrix(ped.count, nrow=63)#63 curves from Tuesday!
+counts = data.frame(counts)
+rownames(counts)<-paste(ped$Sensor[1:63],sep="")
+counts = as.matrix(counts)
+# ind.xx <- seq(33,nrow(ped),by=63)#
+# ggplot_na_distribution(counts[1,])
+plot(counts[33,301:540],type='l') 
+countsweekday = counts
+for (i in 1:52) {
+  countsweekday = countsweekday[,-c((97+(i-1)*5*24):(144+(i-1)*5*24))] #no weekend data
+}
+plot(countsweekday[33,301:700],type='l')
+# N <- ncol(counts)
+N = ncol(countsweekday)
+# N.NA <- rowSums(is.na(counts))#check NA value for each sensor
+N.NA <- rowSums(is.na(countsweekday))
+ind1 <- which(N.NA <= N/3)
+count11 <- countsweekday[ind1,]#52 curves left
+curves = rep(row.names(count11),each = 24)
+time = rep(0:23,times = 52)
+x11 = matrix(0,nrow = 52,ncol = 24)
+na.matrix = matrix(0,nrow = 52,ncol = 24)
+for (k in 1:52) {
+  for (i in 1:24) {
+    for (j in c(seq(i,ncol(count11),by = 24))) {
+      if(is.na(count11[k,j])){
+        x11[k,i] = x11[k,i]
+        na.matrix[k,i] = na.matrix[k,i]+1
+      }else{
+        x11[k,i] = x11[k,i] + count11[k,j]
+        na.matrix[k,i] = na.matrix[k,i]
+      }
+    }
+  }
+}
+# for (i in 1:(365-2*52)) {
+#   a=a+is.na(count11[1,1+(i-1)*24])
+# } to check the na.matrix
+c = matrix(365,nrow = 52,ncol = 24)
+divide = c - na.matrix
+x11 = x11/divide
+trafficdata2011 = as.data.frame(t(x11))
+colname = sprintf("curve%d", 1:52)
+names(trafficdata2011) = colname
+trafficdata2011 = as.matrix(trafficdata2011)
+library(splines)
+modeltraffic = vector()
+trafficBIC = vector()
+j=1
+for (i in 1:15) {
+  basistraffic = create.bspline.basis(c(0, 1),nbasis= i+5)
+  vartraffic<-smooth.basis(argvals=seq(0,1,length.out = 24),y=trafficdata2011,fdParobj=basistraffic)$fd
+  res.uni<-funHDDC(vartraffic,K=4,model=c("AkjBkQkDk", 'AkjBQkDk', 'AkBkQkDk', 'ABkQkDk', 'AkBQkDk', 'ABQkDk','AkjBkQkDk'),init="random",threshold=0.2,itermax = 2000,eps = 1e-4)
+  trafficBIC[j] = min(res.uni$allCriteria$BIC[which(res.uni$allCriteria$BIC!=-Inf)]) 
+  modeltraffic[j] = paste(res.uni$allCriteria$model[which(res.uni$allCriteria$BIC == min(res.uni$allCriteria$BIC[which(res.uni$allCriteria$BIC!=-Inf)]) ,arr.ind = T)],i)
+  j = j+1
+}
+modeltraffic = gsub("\\d","",modeltraffic)
+modeltraffic = chartr("KJ","kj",modeltraffic)
+modeltraffic = gsub(" ", "",modeltraffic)
+basisnumtraf = c(6:20) 
+basistraffic = create.bspline.basis(c(0, 1),nbasis= basisnumtraf[which(trafficBIC==min(trafficBIC))])
+vartraffic<-smooth.basis(argvals=seq(0,1,length.out = 24),y=trafficdata2011,fdParobj=basistraffic)$fd
+res.uni11<-funHDDC(vartraffic,K=4,model=modeltraffic[which(trafficBIC==min(trafficBIC))],init="random",threshold=0.2,itermax = 2000,eps = 1e-4)
+res.uni11$class
+row.names(count11)[which(res.uni11$class==1)]
+row.names(count11)[which(res.uni11$class==2)]
+row.names(count11)[which(res.uni11$class==3)]
+row.names(count11)[which(res.uni11$class==4)]
+plot(x11[1,1:24],type = 'l',xlab = "Hour",ylab="Count",ylim=c(0,3000))
+for (i in 1:52) {
+  if(res.uni11$class[i] ==1 ){
+    lines(x11[i,1:24],col="DarkTurquoise",lty=1)
+  }else if (res.uni11$class[i] ==2 ){
+    lines(x11[i,1:24],col="DeepPink",lty=1)
+  }else if (res.uni11$class[i] ==3 ){
+    lines(x11[i,1:24],col="RosyBrown",lty=1)
+  }else if (res.uni11$class[i] ==4 ){
+    lines(x11[i,1:24],col="Pink",lty=1)
+  }
+}
+
+#traffic data 2003 (weekly)
+library(ggplot2)
+library(ftsa)
+library(rwalkr)
+library(imputeTS)
+library(plot.matrix)
+library(fdapace)
+library(funHDDC)
+# pedestrian data
+# http://www.pedestrian.melbourne.vic.gov.au/
+# retrieved 2019 data
+setwd("/Users/chengyaxiong/Desktop/69-4.Chiou")
+ped <- read.csv('ped.csv')
+ped.count <- ped$Count # a long vector containing all counts from all stations
+# convert ped.count to 
+counts <- matrix(ped.count, nrow=63)#63 curves from Tuesday!
+counts = data.frame(counts)
+rownames(counts)<-paste(ped$Sensor[1:63],sep="")
+counts = as.matrix(counts)
+plot(counts[33,301:540],type='l') 
+countsweekday = counts
+N = ncol(countsweekday)
+N.NA <- rowSums(is.na(countsweekday))
+ind1 <- which(N.NA <= N/3)
+count03wl <- countsweekday[ind1,]
+xweek = matrix(0,nrow = 52,ncol = 24*7)
+na.matrix = matrix(52,nrow = 52,ncol = 6*24)
+tuesday = matrix(53,nrow = 52,ncol = 24)
+divide = cbind(tuesday,na.matrix)
+j = 1
+for (k in 1:52) {
+  for (i in 1:(7*24)) {
+    for (j in c(seq(i,ncol(count03wl),by = 7*24))) {
+      if(is.na(count03wl[k,j])){
+        xweek[k,i] = xweek[k,i]
+        divide[k,i] = divide[k,i]-1
+      }else{
+        xweek[k,i] = xweek[k,i] + count03wl[k,j]
+        divide[k,i] = divide[k,i]
+      }
+    }
+  }
+}
+xweek = xweek/divide
+xvalue = vector()
+for (i in 1:52) {
+  xvalue[(1+(i-1)*24*7):(24*7*i)] = xweek[i,]
+}
+curves = rep(row.names(count03wl),each = 24*7)
+time = rep(0:(24*7-1),times = 52)
+trafficweekly = cbind(matrix(curves,byrow=T),matrix(time,byrow = T),matrix(xvalue,byrow = T))
+timeindex = rep( 1:(24*7), times = 52)
+data = cbind(trafficweekly,timeindex)
+data = data.frame(data)
+grid = c(1:(24*7))
+names(data) <- c("curves","time","xweek","timeindex")
+dataweek = as.matrix(data)
+dataweek[,"curves"] = rep(1:52,each = 24*7)
+traff11weeklyfit <- fitfclust(x=as.numeric(dataweek[,"xweek"]),curve = as.numeric(dataweek[,"curves"]),timeindex = as.numeric(dataweek[,"timeindex"]),q = 5,h = 1, p = 5,K = 4, tol = 0.001, maxit = 20, pert = 0.01, grid = grid, hard = F, plot= F,trace=T)
+fclust.pred(traff11weeklyfit)$class
+row.names(count03wl)[which(fclust.pred(traff11weeklyfit)$class==1)]
+row.names(count03wl)[which(fclust.pred(traff11weeklyfit)$class==2)]
+row.names(count03wl)[which(fclust.pred(traff11weeklyfit)$class==3)]
+row.names(count03wl)[which(fclust.pred(traff11weeklyfit)$class==4)]
+datalabel = cbind(dataweek,forecast = rep(fclust.pred(traff11weeklyfit)$class,each = 24*7))
+datalabel = as.data.frame(datalabel)
+datalabel[,"forecast"] = factor(datalabel[,"forecast"])
+plot(xweek[15,1:168],type = 'l',xlab = "Hour",ylab="Count",ylim=c(0,3000))
+for (i in 1:52) {
+  if(fclust.pred(traff11weeklyfit)$class[i] ==1 ){
+    lines(xweek[i,1:168],col="DarkTurquoise",lty=1)
+  }else if (fclust.pred(traff11weeklyfit)$class[i] ==2 ){
+    lines(xweek[i,1:168],col="DeepPink",lty=1)
+  }else if (fclust.pred(traff11weeklyfit)$class[i] ==3 ){
+    lines(xweek[i,1:168],col="RosyBrown",lty=1)
+  }else if (fclust.pred(traff11weeklyfit)$class[i] ==4 ){
+    lines(xweek[i,1:168],col="Pink",lty=1)
+  }
+}
+# dataweek = as.data.frame(dataweek)
+# library("writexl")
+# write_xlsx(dataweek,"/Users/chengyaxiong/Desktop/thesis\ important\ matrerial/trafficweekly.xlsx")
+
+#traffic data 2007 (weekly)
+library(gdata)
+trafficwkly2007 = as.matrix(read.xls("/Users/chengyaxiong/Desktop/thesis\ important\ matrerial/traffic-weekly-label.xlsx",header=F))
+trafficwkly2007 = trafficwkly2007[,1]
+row.names(count03wl)[which(trafficwkly2007==1)]
+row.names(count03wl)[which(trafficwkly2007==2)]
+row.names(count03wl)[which(trafficwkly2007==3)]
+row.names(count03wl)[which(trafficwkly2007==4)]
+datalabel[,"forecast"] = factor(datalabel[,"forecast"])
+plot(xweek[1,1:168],type = 'l',xlab = "Hour",ylab="Count",ylim=c(0,3000))
+for (i in 1:52) {
+  if(trafficwkly2007[i] ==1 ){
+    lines(xweek[i,1:168],col="DarkTurquoise",lty=1)
+  }else if (trafficwkly2007[i] ==2 ){
+    lines(xweek[i,1:168],col="DeepPink",lty=1)
+  }else if (trafficwkly2007[i] ==3 ){
+    lines(xweek[i,1:168],col="RosyBrown",lty=1)
+  }else if (trafficwkly2007[i] ==4 ){
+    lines(xweek[i,1:168],col="Pink",lty=1)
+  }
+}
+ARIwl0307 = randIndex(table(fclust.pred(traff11weeklyfit)$class,trafficwkly2007))#0.1897866
+ARIwl0311 = randIndex(table(fclust.pred(traff11weeklyfit)$class,res.uni11weekly$class))#0.317339 
+ARIwl0311 = randIndex(table(trafficwkly2007,res.uni11weekly$class))#0.317339 
+
+#traffic data 2011 (weekly)
+library(ggplot2)
+library(ftsa)
+library(rwalkr)
+library(imputeTS)
+library(plot.matrix)
+library(fdapace)
+library(funHDDC)
+# pedestrian data
+# http://www.pedestrian.melbourne.vic.gov.au/
+# retrieved 2019 data
+setwd("/Users/chengyaxiong/Desktop/69-4.Chiou")
+ped <- read.csv('ped.csv')
+ped.count <- ped$Count # a long vector containing all counts from all stations
+# convert ped.count to 
+counts <- matrix(ped.count, nrow=63)#63 curves from Tuesday!
+counts = data.frame(counts)
+rownames(counts)<-paste(ped$Sensor[1:63],sep="")
+counts = as.matrix(counts)
+plot(counts[33,301:540],type='l')
+countsweekday = counts
+N = ncol(countsweekday)
+N.NA <- rowSums(is.na(countsweekday))
+ind1 <- which(N.NA <= N/3)
+countwl11 <- countsweekday[ind1,]
+xwl11 = matrix(0,nrow = 52,ncol = 24*7)
+na.matrix = matrix(52,nrow = 52,ncol = 6*24)
+tuesday = matrix(53,nrow = 52,ncol = 24)
+divide = cbind(tuesday,na.matrix)
+j = 1
+for (k in 1:52) {
+  for (i in 1:(7*24)) {
+    for (j in c(seq(i,ncol(countwl11),by = 7*24))) {
+      if(is.na(countwl11[k,j])){
+        xwl11[k,i] = xwl11[k,i]
+        divide[k,i] = divide[k,i]-1
+      }else{
+        xwl11[k,i] = xwl11[k,i] + countwl11[k,j]
+        divide[k,i] = divide[k,i]
+      }
+    }
+  }
+}
+xwl11 = xwl11/divide
+trafficdata2011 = as.data.frame(t(xwl11))
+colname = sprintf("curve%d", 1:52)
+names(trafficdata2011) = colname
+trafficdata2011 = as.matrix(trafficdata2011)
+library(splines)
+modeltraffic = vector()
+trafficBIC = vector()
+j=1
+for (i in 1:10) {
+  basistraffic = create.bspline.basis(c(0, 1),nbasis= i+20)
+  vartraffic<-smooth.basis(argvals=seq(0,1,length.out = 24*7),y=trafficdata2011,fdParobj=basistraffic)$fd
+  res.uni<-funHDDC(vartraffic,K=4,model=c("AkjBkQkDk", 'AkjBQkDk', 'AkBkQkDk', 'ABkQkDk', 'AkBQkDk', 'ABQkDk','AkjBkQkDk'),init="random",threshold=0.2,itermax = 2000,eps = 1e-4)
+  trafficBIC[j] = min(res.uni$allCriteria$BIC[which(res.uni$allCriteria$BIC!=-Inf)]) 
+  modeltraffic[j] = paste(res.uni$allCriteria$model[which(res.uni$allCriteria$BIC == min(res.uni$allCriteria$BIC[which(res.uni$allCriteria$BIC!=-Inf)]) ,arr.ind = T)],i)
+  j = j+1
+}
+modeltraffic = gsub("\\d","",modeltraffic)
+modeltraffic = chartr("KJ","kj",modeltraffic)
+modeltraffic = gsub(" ", "",modeltraffic)
+basisnumtraf = c(21:30) 
+basistraffic = create.bspline.basis(c(0, 1),nbasis= basisnumtraf[which(trafficBIC==min(trafficBIC))])
+vartraffic<-smooth.basis(argvals=seq(0,1,length.out = 24*7),y=trafficdata2011,fdParobj=basistraffic)$fd
+res.uni11weekly<-funHDDC(vartraffic,K=4,model=modeltraffic[which(trafficBIC==min(trafficBIC))],init="random",threshold=0.2,itermax = 10000,eps = 1e-4)
+res.uni11weekly$class
+row.names(countwl11)[which(res.uni11weekly$class==1)]
+row.names(countwl11)[which(res.uni11weekly$class==2)]
+row.names(countwl11)[which(res.uni11weekly$class==3)]
+row.names(countwl11)[which(res.uni11weekly$class==4)]
+plot(xwl11[1,1:168],type = 'l')
+for (i in 1:52) {
+  if(res.uni11weekly$class[i] ==1 ){
+    lines(xwl11[i,1:168],col="DarkTurquoise",lty=1)
+  }else if (res.uni11weekly$class[i] ==2 ){
+    lines(xwl11[i,1:168],col="DeepPink",lty=1)
+  }else if (res.uni11weekly$class[i] ==3 ){
+    lines(xwl11[i,1:168],col="RosyBrown",lty=1)
+  }else if (res.uni11weekly$class[i] ==4 ){
+    lines(xwl11[i,1:168],col="Pink",lty=1)
+  }
+}
+
+
+
+split.screen(c(1, 3))
+
+screen(1)
+plot(x2003[1,1:24],type = 'l',xlab = "Hour",ylab="Count",ylim=c(0,3000))
+for (i in 1:52) {
+  if(fclust.pred(trafficfit03)$class[i] ==1 ){
+    lines(x2003[i,1:24],col="DarkTurquoise",lty=1)
+  }else if (fclust.pred(trafficfit03)$class[i] ==2 ){
+    lines(x2003[i,1:24],col="Pink",lty=1)
+  }else if (fclust.pred(trafficfit03)$class[i] ==3 ){
+    lines(x2003[i,1:24],col="RosyBrown",lty=1)
+  }else if (fclust.pred(trafficfit03)$class[i] ==4 ){
+    lines(x2003[i,1:24],col="DeepPink",lty=1)
+  }
+}
+screen(2)
+plot(x2003[1,1:24],type = 'l',xlab = "Hour",ylab="Count",ylim=c(0,3000))
+for (i in 1:52) {
+  if(traffic2007[i] ==1 ){
+    lines(x2003[i,1:24],col="Pink",lty=1)
+  }else if (traffic2007[i] ==2 ){
+    lines(x2003[i,1:24],col="RosyBrown",lty=1)
+  }else if (traffic2007[i] ==3 ){
+    lines(x2003[i,1:24],col="DeepPink",lty=1)
+  }else if (traffic2007[i] ==4 ){
+    lines(x2003[i,1:24],col="DarkTurquoise",lty=1)
+  }
+}
+#
+screen(3)
+plot(x11[1,1:24],type = 'l',xlab = "Hour",ylab="Count",ylim=c(0,3000))
+for (i in 1:52) {
+  if(res.uni11$class[i] ==1 ){
+    lines(x11[i,1:24],col="Pink",lty=1)
+  }else if (res.uni11$class[i] ==2 ){
+    lines(x11[i,1:24],col="DeepPink",lty=1)
+  }else if (res.uni11$class[i] ==3 ){
+    lines(x11[i,1:24],col="DarkTurquoise",lty=1)
+  }else if (res.uni11$class[i] ==4 ){
+    lines(x11[i,1:24],col="RosyBrown",lty=1)
+  }
+}
+screen(1)
+plot(xweek[15,1:168],type = 'l',xlab = "Hour",ylab="Count",ylim=c(0,4000))
+for (i in 1:52) {
+  if(fclust.pred(traff11weeklyfit)$class[i] ==1 ){
+    lines(xweek[i,1:168],col="DarkTurquoise",lty=1)
+  }else if (fclust.pred(traff11weeklyfit)$class[i] ==2 ){
+    lines(xweek[i,1:168],col="DeepPink",lty=1)
+  }else if (fclust.pred(traff11weeklyfit)$class[i] ==3 ){
+    lines(xweek[i,1:168],col="RosyBrown",lty=1)
+  }else if (fclust.pred(traff11weeklyfit)$class[i] ==4 ){
+    lines(xweek[i,1:168],col="Pink",lty=1)
+  }
+}
+screen(2)
+plot(xweek[1,1:168],type = 'l',xlab = "Hour",ylab="Count",ylim=c(0,4000))
+for (i in 1:52) {
+  if(trafficwkly2007[i] ==1 ){
+    lines(xweek[i,1:168],col="RosyBrown",lty=1)
+  }else if (trafficwkly2007[i] ==2 ){
+    lines(xweek[i,1:168],col="DarkTurquoise",lty=1)
+  }else if (trafficwkly2007[i] ==3 ){
+    lines(xweek[i,1:168],col="DeepPink",lty=1)
+  }else if (trafficwkly2007[i] ==4 ){
+    lines(xweek[i,1:168],col="Pink",lty=1)
+  }
+}
+screen(3)
+plot(xwl11[1,1:168],type = 'l',xlab = "Hour",ylab="Count",ylim=c(0,4000))
+for (i in 1:52) {
+  if(res.uni11weekly$class[i] ==1 ){
+    lines(xwl11[i,1:168],col="DarkTurquoise",lty=1)
+  }else if (res.uni11weekly$class[i] ==2 ){
+    lines(xwl11[i,1:168],col="Pink",lty=1)
+  }else if (res.uni11weekly$class[i] ==3 ){
+    lines(xwl11[i,1:168],col="RosyBrown",lty=1)
+  }else if (res.uni11weekly$class[i] ==4 ){
+    lines(xwl11[i,1:168],col="DeepPink",lty=1)
+  }
